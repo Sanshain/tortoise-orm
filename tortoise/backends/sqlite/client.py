@@ -38,7 +38,9 @@ def translate_exceptions(func: F) -> F:
 class SqliteClient(BaseDBAsyncClient):
     executor_class = SqliteExecutor
     schema_generator = SqliteSchemaGenerator
-    capabilities = Capabilities("sqlite", daemon=False, requires_limit=True, inline_comment=True)
+    capabilities = Capabilities(
+        "sqlite", daemon=False, requires_limit=True, inline_comment=True, support_for_update=False
+    )
 
     def __init__(self, file_path: str, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -82,6 +84,7 @@ class SqliteClient(BaseDBAsyncClient):
             self._connection = None
 
     async def db_create(self) -> None:
+        # DB's are automatically created once accessed
         pass
 
     async def db_delete(self) -> None:
@@ -90,6 +93,9 @@ class SqliteClient(BaseDBAsyncClient):
             os.remove(self.filename)
         except FileNotFoundError:  # pragma: nocoverage
             pass
+        except OSError as e:
+            if e.errno != 22:  # fix: "sqlite://:memory:" in Windows
+                raise e
 
     def acquire_connection(self) -> ConnectionWrapper:
         return ConnectionWrapper(self._connection, self._lock)
@@ -121,6 +127,7 @@ class SqliteClient(BaseDBAsyncClient):
     async def execute_query(
         self, query: str, values: Optional[list] = None
     ) -> Tuple[int, Sequence[dict]]:
+        query = query.replace("\x00", "'||CHAR(0)||'")
         async with self.acquire_connection() as connection:
             self.log.debug("%s: %s", query, values)
             start = connection.total_changes
@@ -129,6 +136,7 @@ class SqliteClient(BaseDBAsyncClient):
 
     @translate_exceptions
     async def execute_query_dict(self, query: str, values: Optional[list] = None) -> List[dict]:
+        query = query.replace("\x00", "'||CHAR(0)||'")
         async with self.acquire_connection() as connection:
             self.log.debug("%s: %s", query, values)
             return list(map(dict, await connection.execute_fetchall(query, values)))
@@ -143,7 +151,7 @@ class SqliteClient(BaseDBAsyncClient):
 class TransactionWrapper(SqliteClient, BaseTransactionWrapper):
     def __init__(self, connection: SqliteClient) -> None:
         self.connection_name = connection.connection_name
-        self._connection: aiosqlite.Connection = connection._connection
+        self._connection: aiosqlite.Connection = connection._connection  # type: ignore
         self._lock = asyncio.Lock()
         self._trxlock = connection._lock
         self.log = connection.log

@@ -1,22 +1,30 @@
 import logging
 from typing import Dict, List, Optional
 
-from starlette.applications import Starlette  # pylint: disable=E0401
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel  # pylint: disable=E0611
 
 from tortoise import Tortoise
+from tortoise.exceptions import DoesNotExist, IntegrityError
+
+
+class HTTPNotFoundError(BaseModel):
+    detail: str
 
 
 def register_tortoise(
-    app: Starlette,
+    app: FastAPI,
     config: Optional[dict] = None,
     config_file: Optional[str] = None,
     db_url: Optional[str] = None,
     modules: Optional[Dict[str, List[str]]] = None,
     generate_schemas: bool = False,
+    add_exception_handlers: bool = False,
 ) -> None:
     """
     Registers ``startup`` and ``shutdown`` events to set-up and tear-down Tortoise-ORM
-    inside a Starlette application.
+    inside a FastAPI application.
 
     You can configure using only one of ``config``, ``config_file``
     and ``(db_url, modules)``.
@@ -24,7 +32,7 @@ def register_tortoise(
     Parameters
     ----------
     app:
-        Starlette app.
+        FastAPI app.
     config:
         Dict containing config:
 
@@ -69,6 +77,9 @@ def register_tortoise(
     generate_schemas:
         True to generate schema immediately. Only useful for dev environments
         or SQLite ``:memory:`` databases
+    add_exception_handlers:
+        True to add some automatic exception handlers for ``DoesNotExist`` & ``IntegrityError``.
+        This is not recommended for production systems as it may leak data.
 
     Raises
     ------
@@ -88,3 +99,16 @@ def register_tortoise(
     async def close_orm() -> None:  # pylint: disable=W0612
         await Tortoise.close_connections()
         logging.info("Tortoise-ORM shutdown")
+
+    if add_exception_handlers:
+
+        @app.exception_handler(DoesNotExist)
+        async def doesnotexist_exception_handler(request: Request, exc: DoesNotExist):
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+        @app.exception_handler(IntegrityError)
+        async def integrityerror_exception_handler(request: Request, exc: IntegrityError):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": [], "msg": str(exc), "type": "IntegrityError"}]},
+            )

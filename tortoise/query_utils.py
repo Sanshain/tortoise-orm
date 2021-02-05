@@ -2,7 +2,7 @@ from copy import copy
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, cast
 
 from pypika import Table
-from pypika.terms import Criterion
+from pypika.terms import Criterion, Term
 
 from tortoise.exceptions import FieldError, OperationalError
 from tortoise.fields.relational import BackwardFKRelation, ManyToManyFieldInstance, RelationalField
@@ -23,22 +23,25 @@ def _process_filter_kwarg(
     else:
         param = model._meta.get_filter(key)
 
-    pk_db_field = model._meta.db_pk_field
+    pk_db_field = model._meta.db_pk_column
     if param.get("table"):
         join = (
             param["table"],
-            table[pk_db_field] == getattr(param["table"], param["backward_key"]),
+            table[pk_db_field] == param["table"][param["backward_key"]],
         )
         if param.get("value_encoder"):
             value = param["value_encoder"](value, model)
-        criterion = param["operator"](getattr(param["table"], param["field"]), value)
+        criterion = param["operator"](param["table"][param["field"]], value)
     else:
-        field_object = model._meta.fields_map[param["field"]]
-        encoded_value = (
-            param["value_encoder"](value, model, field_object)
-            if param.get("value_encoder")
-            else model._meta.db.executor_class._field_to_db(field_object, value, model)
-        )
+        if isinstance(value, Term):
+            encoded_value = value
+        else:
+            field_object = model._meta.fields_map[param["field"]]
+            encoded_value = (
+                param["value_encoder"](value, model, field_object)
+                if param.get("value_encoder")
+                else model._meta.db.executor_class._field_to_db(field_object, value, model)
+            )
         criterion = param["operator"](table[param["source_field"]], encoded_value)
     return criterion, join
 
@@ -48,41 +51,49 @@ def _get_joins_for_related_field(
 ) -> List[Tuple[Table, Criterion]]:
     required_joins = []
 
-    related_table: Table = related_field.model_class._meta.basetable
+    related_table: Table = related_field.related_model._meta.basetable
     if isinstance(related_field, ManyToManyFieldInstance):
         through_table = Table(related_field.through)
         required_joins.append(
             (
                 through_table,
-                getattr(table, related_field.model._meta.db_pk_field)
-                == getattr(through_table, related_field.backward_key),
+                table[related_field.model._meta.db_pk_column]
+                == through_table[related_field.backward_key],
             )
         )
         required_joins.append(
             (
                 related_table,
-                getattr(through_table, related_field.forward_key)
-                == getattr(related_table, related_field.model_class._meta.db_pk_field),
+                through_table[related_field.forward_key]
+                == related_table[related_field.related_model._meta.db_pk_column],
             )
         )
     elif isinstance(related_field, BackwardFKRelation):
+        to_field_source_field = (
+            related_field.to_field_instance.source_field
+            or related_field.to_field_instance.model_field_name
+        )
+
         if table == related_table:
             related_table = related_table.as_(f"{table.get_table_name()}__{related_field_name}")
         required_joins.append(
             (
                 related_table,
-                getattr(table, related_field.to_field_instance.model_field_name)
-                == getattr(related_table, related_field.relation_field),
+                table[to_field_source_field] == related_table[related_field.relation_source_field],
             )
         )
     else:
+        to_field_source_field = (
+            related_field.to_field_instance.source_field
+            or related_field.to_field_instance.model_field_name
+        )
+
+        from_field = related_field.model._meta.fields_map[related_field.source_field]  # type: ignore
+        from_field_source_field = from_field.source_field or from_field.model_field_name
+
         related_table = related_table.as_(f"{table.get_table_name()}__{related_field_name}")
         required_joins.append(
-            (
-                related_table,
-                getattr(related_table, related_field.to_field_instance.model_field_name)
-                == getattr(table, f"{related_field_name}_id"),
-            )
+            (related_table, related_table[to_field_source_field] == table[from_field_source_field],)
         )
     return required_joins
 
@@ -142,16 +153,17 @@ class QueryModifier:
             return QueryModifier(
                 joins=self.joins + other.joins, having_criterion=result_having_criterion
             )
+
         if self.where_criterion and other.where_criterion:
             return QueryModifier(
                 where_criterion=self.where_criterion | other.where_criterion,
                 joins=self.joins + other.joins,
             )
-        else:
-            return QueryModifier(
-                where_criterion=self.where_criterion or other.where_criterion,
-                joins=self.joins + other.joins,
-            )
+
+        return QueryModifier(
+            where_criterion=self.where_criterion or other.where_criterion,
+            joins=self.joins + other.joins,
+        )
 
     def __invert__(self) -> "QueryModifier":
         if not self.where_criterion and not self.having_criterion:
@@ -215,6 +227,8 @@ class Q:
     def __and__(self, other: "Q") -> "Q":
         """
         Returns a binary AND of Q objects, use ``AND`` operator.
+
+        :raises OperationalError: AND operation requires a Q node
         """
         if not isinstance(other, Q):
             raise OperationalError("AND operation requires a Q node")
@@ -223,6 +237,8 @@ class Q:
     def __or__(self, other: "Q") -> "Q":
         """
         Returns a binary OR of Q objects, use ``OR`` operator.
+
+        :raises OperationalError: OR operation requires a Q node
         """
         if not isinstance(other, Q):
             raise OperationalError("OR operation requires a Q node")
@@ -249,7 +265,7 @@ class Q:
         related_field = cast(RelationalField, model._meta.fields_map[related_field_name])
         required_joins = _get_joins_for_related_field(table, related_field, related_field_name)
         modifier = Q(**{"__".join(key.split("__")[1:]): value}).resolve(
-            model=related_field.model_class,
+            model=related_field.related_model,
             annotations=self._annotations,
             custom_filters=self._custom_filters,
             table=required_joins[-1][0],
@@ -310,7 +326,7 @@ class Q:
             filter_value = value
         else:
             allowed = sorted(
-                list(model._meta.fields | model._meta.fetch_fields | set(self._custom_filters))
+                model._meta.fields | model._meta.fetch_fields | set(self._custom_filters)
             )
             raise FieldError(f"Unknown filter param '{key}'. Allowed base values are {allowed}")
         return filter_key, filter_value
@@ -357,7 +373,7 @@ class Q:
 
         :param model: The Model this Q Expression should be resolved on.
         :param annotations: Extra annotations one wants to inject into the resultset.
-        :param custom_filters:
+        :param custom_filters: Pre-resolved filters to be passed though.
         :param table: ``pypika.Table`` to keep track of the virtual SQL table
             (to allow self referential joins)
         """
@@ -375,11 +391,13 @@ class Prefetch:
 
     :param relation: Related field name.
     :param queryset: Custom QuerySet to use for prefetching.
+    :param to_attr: Sets the result of the prefetch operation to a custom attribute.
     """
 
-    __slots__ = ("relation", "queryset")
+    __slots__ = ("relation", "queryset", "to_attr")
 
-    def __init__(self, relation: str, queryset: "QuerySet") -> None:
+    def __init__(self, relation: str, queryset: "QuerySet", to_attr: Optional[str] = None) -> None:
+        self.to_attr = to_attr
         self.relation = relation
         self.queryset = queryset
         self.queryset.query = copy(self.queryset.model._meta.basequery)
@@ -389,19 +407,22 @@ class Prefetch:
         Called internally to generate prefetching query.
 
         :param queryset: Custom QuerySet to use for prefetching.
+        :raises OperationalError: If field does not exist in model.
         """
         relation_split = self.relation.split("__")
         first_level_field = relation_split[0]
         if first_level_field not in queryset.model._meta.fetch_fields:
             raise OperationalError(
-                f"relation {first_level_field} for {queryset.model._meta.table} not found"
+                f"relation {first_level_field} for {queryset.model._meta.db_table} not found"
             )
         forwarded_prefetch = "__".join(relation_split[1:])
         if forwarded_prefetch:
             if first_level_field not in queryset._prefetch_map.keys():
                 queryset._prefetch_map[first_level_field] = set()
             queryset._prefetch_map[first_level_field].add(
-                Prefetch(forwarded_prefetch, self.queryset)
+                Prefetch(forwarded_prefetch, self.queryset, to_attr=self.to_attr)
             )
         else:
-            queryset._prefetch_queries[first_level_field] = self.queryset
+            queryset._prefetch_queries.setdefault(first_level_field, []).append(
+                (self.to_attr, self.queryset)
+            )

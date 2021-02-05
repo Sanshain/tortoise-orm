@@ -1,13 +1,13 @@
 import logging
 from typing import Dict, List, Optional
 
-from starlette.applications import Starlette  # pylint: disable=E0401
+from aiohttp import web  # pylint: disable=E0401
 
 from tortoise import Tortoise
 
 
 def register_tortoise(
-    app: Starlette,
+    app: web.Application,
     config: Optional[dict] = None,
     config_file: Optional[str] = None,
     db_url: Optional[str] = None,
@@ -15,8 +15,8 @@ def register_tortoise(
     generate_schemas: bool = False,
 ) -> None:
     """
-    Registers ``startup`` and ``shutdown`` events to set-up and tear-down Tortoise-ORM
-    inside a Starlette application.
+    Registers ``on_startup`` and ``on_shutdown`` hooks to set-up and tear-down
+    Tortoise-ORM inside a Aiohttp webserver.
 
     You can configure using only one of ``config``, ``config_file``
     and ``(db_url, modules)``.
@@ -24,7 +24,7 @@ def register_tortoise(
     Parameters
     ----------
     app:
-        Starlette app.
+        Aiohttp app.
     config:
         Dict containing config:
 
@@ -76,15 +76,16 @@ def register_tortoise(
         For any configuration error
     """
 
-    @app.on_event("startup")
-    async def init_orm() -> None:  # pylint: disable=W0612
+    async def init_orm(app):  # pylint: disable=W0612
         await Tortoise.init(config=config, config_file=config_file, db_url=db_url, modules=modules)
-        logging.info("Tortoise-ORM started, %s, %s", Tortoise._connections, Tortoise.apps)
+        logging.info(f"Tortoise-ORM started, {Tortoise._connections}, {Tortoise.apps}")
         if generate_schemas:
             logging.info("Tortoise-ORM generating schema")
             await Tortoise.generate_schemas()
 
-    @app.on_event("shutdown")
-    async def close_orm() -> None:  # pylint: disable=W0612
+    async def close_orm(app):  # pylint: disable=W0612
         await Tortoise.close_connections()
         logging.info("Tortoise-ORM shutdown")
+
+    app.on_startup.append(init_orm)
+    app.on_cleanup.append(close_orm)

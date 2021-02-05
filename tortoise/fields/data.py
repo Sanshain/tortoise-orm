@@ -11,7 +11,7 @@ from pypika import functions
 from pypika.enums import SqlTypes
 from pypika.terms import Term
 
-from tortoise.exceptions import ConfigurationError
+from tortoise.exceptions import ConfigurationError, FieldError
 from tortoise.fields.base import Field
 
 try:
@@ -20,7 +20,6 @@ except ImportError:  # pragma: nocoverage
     from iso8601 import parse_date
 
     parse_datetime = functools.partial(parse_date, default_timezone=None)
-
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.models import Model
@@ -76,6 +75,13 @@ class IntField(Field, int):
             kwargs["generated"] = bool(kwargs.get("generated", True))
         super().__init__(pk=pk, **kwargs)
 
+    @property
+    def constraints(self) -> dict:
+        return {
+            "ge": 1 if self.generated or self.reference else -2147483648,
+            "le": 2147483647,
+        }
+
     class _db_postgres:
         GENERATED_SQL = "SERIAL NOT NULL PRIMARY KEY"
 
@@ -102,6 +108,13 @@ class BigIntField(Field, int):
             kwargs["generated"] = bool(kwargs.get("generated", True))
         super().__init__(pk=pk, **kwargs)
 
+    @property
+    def constraints(self) -> dict:
+        return {
+            "ge": 1 if self.generated or self.reference else -9223372036854775808,
+            "le": 9223372036854775807,
+        }
+
     class _db_postgres:
         GENERATED_SQL = "BIGSERIAL NOT NULL PRIMARY KEY"
 
@@ -127,6 +140,13 @@ class SmallIntField(Field, int):
         if pk:
             kwargs["generated"] = bool(kwargs.get("generated", True))
         super().__init__(pk=pk, **kwargs)
+
+    @property
+    def constraints(self) -> dict:
+        return {
+            "ge": 1 if self.generated or self.reference else -32768,
+            "le": 32767,
+        }
 
     class _db_postgres:
         GENERATED_SQL = "SMALLSERIAL NOT NULL PRIMARY KEY"
@@ -155,6 +175,12 @@ class CharField(Field, str):  # type: ignore
         super().__init__(**kwargs)
 
     @property
+    def constraints(self) -> dict:
+        return {
+            "max_length": self.max_length,
+        }
+
+    @property
     def SQL_TYPE(self) -> str:  # type: ignore
         return f"VARCHAR({self.max_length})"
 
@@ -178,10 +204,10 @@ class TextField(Field, str):  # type: ignore
             )
         if unique:
             raise ConfigurationError(
-                f"TextField doesn't support unique indexes, consider CharField or another strategy"
+                "TextField doesn't support unique indexes, consider CharField or another strategy"
             )
         if index:
-            raise ConfigurationError(f"TextField can't be indexed, consider CharField")
+            raise ConfigurationError("TextField can't be indexed, consider CharField")
 
         super().__init__(pk=pk, **kwargs)
 
@@ -271,20 +297,29 @@ class DatetimeField(Field, datetime.datetime):
     def to_python_value(self, value: Any) -> Optional[datetime.datetime]:
         if value is None or isinstance(value, datetime.datetime):
             return value
+        if isinstance(value, int):
+            return datetime.datetime.fromtimestamp(value)
         return parse_datetime(value)
 
     def to_db_value(
         self, value: Optional[datetime.datetime], instance: "Union[Type[Model], Model]"
     ) -> Optional[datetime.datetime]:
-        if hasattr(instance, "_saved_in_db"):
-            # Only do this if it is a Model instance, not class. Test for guaranteed instance var
-            if self.auto_now or (
-                self.auto_now_add and getattr(instance, self.model_field_name) is None
-            ):
-                value = datetime.datetime.utcnow()
-                setattr(instance, self.model_field_name, value)
-                return value
+        # Only do this if it is a Model instance, not class. Test for guaranteed instance var
+        if hasattr(instance, "_saved_in_db") and (
+            self.auto_now
+            or (self.auto_now_add and getattr(instance, self.model_field_name) is None)
+        ):
+            value = datetime.datetime.now()
+            setattr(instance, self.model_field_name, value)
+            return value
         return value
+
+    @property
+    def constraints(self) -> dict:
+        data = {}
+        if self.auto_now_add:
+            data["readOnly"] = True
+        return data
 
 
 class DateField(Field, datetime.date):
@@ -296,6 +331,13 @@ class DateField(Field, datetime.date):
     SQL_TYPE = "DATE"
 
     def to_python_value(self, value: Any) -> Optional[datetime.date]:
+        if value is None or isinstance(value, datetime.date):
+            return value
+        return parse_datetime(value).date()
+
+    def to_db_value(
+        self, value: Optional[Union[datetime.date, str]], instance: "Union[Type[Model], Model]"
+    ) -> Optional[datetime.date]:
         if value is None or isinstance(value, datetime.date):
             return value
         return parse_datetime(value).date()
@@ -369,14 +411,25 @@ class JSONField(Field, dict, list):  # type: ignore
         self.decoder = decoder
 
     def to_db_value(
-        self, value: Optional[Union[dict, list]], instance: "Union[Type[Model], Model]"
+        self, value: Optional[Union[dict, list, str]], instance: "Union[Type[Model], Model]"
     ) -> Optional[str]:
+        if isinstance(value, str):
+            try:
+                self.decoder(value)
+            except Exception:
+                raise FieldError(f"Value {value} is invalid json value.")
+            return value
         return None if value is None else self.encoder(value)
 
     def to_python_value(
         self, value: Optional[Union[str, dict, list]]
     ) -> Optional[Union[dict, list]]:
-        return self.decoder(value) if isinstance(value, str) else value
+        if isinstance(value, str):
+            try:
+                return self.decoder(value)
+            except Exception:
+                raise FieldError(f"Value {value} is invalid json value.")
+        return value
 
 
 class UUIDField(Field, UUID):
@@ -394,9 +447,8 @@ class UUIDField(Field, UUID):
         SQL_TYPE = "UUID"
 
     def __init__(self, **kwargs: Any) -> None:
-        if kwargs.get("pk", False):
-            if "default" not in kwargs:
-                kwargs["default"] = uuid4
+        if kwargs.get("pk", False) and "default" not in kwargs:
+            kwargs["default"] = uuid4
         super().__init__(**kwargs)
 
     def to_db_value(self, value: Any, instance: "Union[Type[Model], Model]") -> Optional[str]:
@@ -450,9 +502,13 @@ class IntEnumFieldInstance(SmallIntField):
         return self.enum_type(value) if value is not None else None
 
     def to_db_value(
-        self, value: Union[IntEnum, None], instance: "Union[Type[Model], Model]"
+        self, value: Union[IntEnum, None, int], instance: "Union[Type[Model], Model]"
     ) -> Union[int, None]:
-        return int(value.value) if value is not None else None
+        if isinstance(value, IntEnum):
+            return int(value.value)
+        if isinstance(value, int):
+            return int(self.enum_type(value))
+        return value
 
 
 IntEnumType = TypeVar("IntEnumType", bound=IntEnum)
@@ -468,6 +524,8 @@ def IntEnumField(
 
     The description of the field is set automatically if not specified to a multiline list of
     "name: value" pairs.
+
+    **Note**: Valid int value of ``enum_type`` is acceptable.
 
     ``enum_type``:
         The enum class
@@ -505,9 +563,13 @@ class CharEnumFieldInstance(CharField):
         return self.enum_type(value) if value is not None else None
 
     def to_db_value(
-        self, value: Union[Enum, None], instance: "Union[Type[Model], Model]"
+        self, value: Union[Enum, None, str], instance: "Union[Type[Model], Model]"
     ) -> Union[str, None]:
-        return str(value.value) if value is not None else None
+        if isinstance(value, Enum):
+            return str(value.value)
+        if isinstance(value, str):
+            return str(self.enum_type(value).value)
+        return value
 
 
 CharEnumType = TypeVar("CharEnumType", bound=Enum)
@@ -527,6 +589,8 @@ def CharEnumField(
     **Warning**: If ``max_length`` is not specified or equals to zero, the size of represented
     char fields is automatically detected. So if later you update the enum, you need to update your
     table schema as well.
+
+    **Note**: Valid str value of ``enum_type`` is acceptable.
 
     ``enum_type``:
         The enum class

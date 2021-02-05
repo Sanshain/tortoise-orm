@@ -1,15 +1,19 @@
-from typing import TYPE_CHECKING, Any, Optional, Type, cast
+from typing import TYPE_CHECKING, Any, Optional, Type, Union, cast
 
-from pypika import Table, functions
-from pypika.terms import AggregateFunction
+from pypika import Case, Table, functions
+from pypika.functions import DistinctOptionFunction
+from pypika.terms import ArithmeticExpression
 from pypika.terms import Function as BaseFunction
 
 from tortoise.exceptions import ConfigurationError
+from tortoise.expressions import F
 from tortoise.fields.relational import BackwardFKRelation, ForeignKeyFieldInstance, RelationalField
+from tortoise.query_utils import Q, QueryModifier
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.models import Model
     from tortoise.fields.base import Field
+
 
 ##############################################################################
 # Base
@@ -40,61 +44,62 @@ class Function:
     # Enable populate_field_object where we want to try and preserve the field type.
     populate_field_object = False
 
-    def __init__(self, field: str, *default_values: Any) -> None:
+    def __init__(self, field: Union[str, F, ArithmeticExpression], *default_values: Any) -> None:
         self.field = field
         self.field_object: "Optional[Field]" = None
         self.default_values = default_values
 
-    def _resolve_field_for_model(
-        self, model: "Type[Model]", table: Table, field: str, *default_values: Any
-    ) -> dict:
-        field_split = field.split("__")
-        if not field_split[1:]:
-            function_joins = []
-            if field_split[0] in model._meta.fetch_fields:
-                related_field = cast(RelationalField, model._meta.fields_map[field_split[0]])
-                related_field_meta = related_field.model_class._meta
-                related_table = related_field_meta.basetable
-                if isinstance(related_field, BackwardFKRelation):
-                    if table == related_table:
-                        related_table = related_table.as_(
-                            f"{table.get_table_name()}__{field_split[0]}"
-                        )
-                join = (table, field_split[0], related_field)
-                function_joins.append(join)
-                field = related_table[related_field_meta.db_pk_field]
+    def _get_function_field(
+        self, field: "Union[ArithmeticExpression, Field, str]", *default_values
+    ):
+        return self.database_func(field, *default_values)
+
+    def _resolve_field_for_model(self, model: "Type[Model]", table: Table, field: str) -> dict:
+        joins = []
+        fields = field.split("__")
+
+        for iter_field in fields[:-1]:
+            if iter_field not in model._meta.fetch_fields:
+                raise ConfigurationError(f"{field} not resolvable")
+
+            related_field = cast(RelationalField, model._meta.fields_map[iter_field])
+            joins.append((table, iter_field, related_field))
+
+            model = related_field.related_model
+            related_table: Table = related_field.related_model._meta.basetable
+            if isinstance(related_field, ForeignKeyFieldInstance):
+                # Only FK's can be to same table, so we only auto-alias FK join tables
+                related_table = related_table.as_(f"{table.get_table_name()}__{iter_field}")
+            table = related_table
+
+        last_field = fields[-1]
+        if last_field in model._meta.fetch_fields:
+            related_field = cast(RelationalField, model._meta.fields_map[last_field])
+            related_field_meta = related_field.related_model._meta
+            joins.append((table, last_field, related_field))
+            related_table = related_field_meta.basetable
+
+            if isinstance(related_field, BackwardFKRelation):
+                if table == related_table:
+                    related_table = related_table.as_(f"{table.get_table_name()}__{last_field}")
+
+            field = related_table[related_field_meta.db_pk_column]
+        else:
+            field_object = model._meta.fields_map[last_field]
+            if field_object.source_field:
+                field = table[field_object.source_field]
             else:
-                field_object = model._meta.fields_map[field_split[0]]
-                if field_object.source_field:
-                    field = table[field_object.source_field]
-                else:
-                    field = table[field_split[0]]
+                field = table[last_field]
+            if self.populate_field_object:
+                self.field_object = model._meta.fields_map.get(last_field, None)
+                if self.field_object:  # pragma: nobranch
+                    func = self.field_object.get_for_dialect(
+                        model._meta.db.capabilities.dialect, "function_cast"
+                    )
+                    if func:
+                        field = func(self.field_object, field)
 
-                if self.populate_field_object:
-                    self.field_object = model._meta.fields_map.get(field_split[0], None)
-                    if self.field_object:  # pragma: nobranch
-                        func = self.field_object.get_for_dialect(
-                            model._meta.db.capabilities.dialect, "function_cast"
-                        )
-                        if func:
-                            field = func(self.field_object, field)
-
-            function_field = self.database_func(field, *default_values)
-            return {"joins": function_joins, "field": function_field}
-
-        if field_split[0] not in model._meta.fetch_fields:
-            raise ConfigurationError(f"{field} not resolvable")
-        related_field = cast(RelationalField, model._meta.fields_map[field_split[0]])
-        join = (table, field_split[0], related_field)
-        related_table = related_field.model_class._meta.basetable
-        if isinstance(related_field, ForeignKeyFieldInstance):
-            # Only FK's can be to same table, so we only auto-alias FK join tables
-            related_table = related_table.as_(f"{table.get_table_name()}__{field_split[0]}")
-        function = self._resolve_field_for_model(
-            related_field.model_class, related_table, "__".join(field_split[1:]), *default_values
-        )
-        function["joins"].append(join)
-        return function
+        return {"joins": joins, "field": field}
 
     def resolve(self, model: "Type[Model]", table: Table) -> dict:
         """
@@ -105,17 +110,56 @@ class Function:
             (to allow self referential joins)
         :return: Dict with keys ``"joins"`` and ``"fields"``
         """
-        function = self._resolve_field_for_model(model, table, self.field, *self.default_values)
-        function["joins"] = reversed(function["joins"])
-        return function
+
+        if isinstance(self.field, str):
+            function = self._resolve_field_for_model(model, table, self.field)
+            function["field"] = self._get_function_field(function["field"], *self.default_values)
+            return function
+
+        field, field_object = F.resolver_arithmetic_expression(model, self.field)
+        if self.populate_field_object:
+            self.field_object = field_object
+        return {"joins": [], "field": self._get_function_field(field, *self.default_values)}
 
 
 class Aggregate(Function):
     """
     Base for SQL Aggregates.
+
+    :param field: Field name
+    :param default_values: Extra parameters to the function.
+    :param is_distinct: Flag for aggregate with distinction
     """
 
-    database_func = AggregateFunction
+    database_func = DistinctOptionFunction
+
+    def __init__(
+        self,
+        field: Union[str, F, ArithmeticExpression],
+        *default_values: Any,
+        distinct=False,
+        _filter: Optional[Q] = None,
+    ) -> None:
+        super().__init__(field, *default_values)
+        self.distinct = distinct
+        self.filter = _filter
+
+    def _get_function_field(
+        self, field: "Union[ArithmeticExpression, Field, str]", *default_values
+    ):
+        if self.distinct:
+            return self.database_func(field, *default_values).distinct()
+        return self.database_func(field, *default_values)
+
+    def _resolve_field_for_model(self, model: "Type[Model]", table: Table, field: str) -> dict:
+        ret = super()._resolve_field_for_model(model, table, field)
+        if self.filter:
+            modifier = QueryModifier()
+            modifier &= self.filter.resolve(model, {}, {}, model._meta.basetable)
+            where_criterion, joins, having_criterion = modifier.get_query_modifiers()
+            ret["field"] = Case().when(where_criterion, ret["field"]).else_(None)
+
+        return ret
 
 
 ##############################################################################
@@ -135,7 +179,7 @@ class Trim(Function):
 
 class Length(Function):
     """
-    Returns lenth of text/blob.
+    Returns length of text/blob.
 
     :samp:`Length("{FIELD_NAME}")`
     """

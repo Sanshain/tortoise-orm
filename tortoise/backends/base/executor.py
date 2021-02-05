@@ -3,9 +3,24 @@ import datetime
 import decimal
 from copy import copy
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 from pypika import JoinType, Parameter, Query, Table
+from pypika.terms import ArithmeticExpression, Function
 
 from tortoise.exceptions import OperationalError
 from tortoise.fields.base import Field
@@ -13,6 +28,7 @@ from tortoise.fields.relational import (
     BackwardFKRelation,
     BackwardOneToOneRelation,
     ManyToManyFieldInstance,
+    RelationalField,
 )
 from tortoise.query_utils import QueryModifier
 
@@ -38,14 +54,15 @@ class BaseExecutor:
         model: "Type[Model]",
         db: "BaseDBAsyncClient",
         prefetch_map: "Optional[Dict[str, Set[Union[str, Prefetch]]]]" = None,
-        prefetch_queries: Optional[Dict[str, "QuerySet"]] = None,
+        prefetch_queries: Optional[Dict[str, List[Tuple[Optional[str], "QuerySet"]]]] = None,
+        select_related_idx: Optional[List[Tuple["Type[Model]", int, str, "Type[Model]"]]] = None,
     ) -> None:
         self.model = model
         self.db: "BaseDBAsyncClient" = db
         self.prefetch_map = prefetch_map or {}
         self._prefetch_queries = prefetch_queries or {}
-
-        key = f"{self.db.connection_name}:{self.model._meta.table}"
+        self.select_related_idx = select_related_idx
+        key = f"{self.db.connection_name}:{self.model._meta.db_table}"
         if key not in EXECUTOR_CACHE:
             self.regular_columns, columns = self._prepare_insert_columns()
             self.insert_query = self._prepare_insert_statement(columns)
@@ -56,7 +73,7 @@ class BaseExecutor:
                     include_generated=True
                 )
                 self.insert_query_all = self._prepare_insert_statement(
-                    columns_all, no_generated=True
+                    columns_all, has_generated=False
                 )
 
             self.column_map: Dict[str, Callable[[Any, Any], Any]] = {}
@@ -72,7 +89,7 @@ class BaseExecutor:
             table = self.model._meta.basetable
             self.delete_query = str(
                 self.model._meta.basequery.where(
-                    table[self.model._meta.db_pk_field] == self.Parameter(0)
+                    table[self.model._meta.db_pk_column] == self.parameter(0)
                 ).delete()
             )
             self.update_cache: Dict[str, str] = {}
@@ -86,6 +103,7 @@ class BaseExecutor:
                 self.delete_query,
                 self.update_cache,
             )
+
         else:
             (
                 self.regular_columns,
@@ -105,7 +123,34 @@ class BaseExecutor:
         _, raw_results = await self.db.execute_query(query.get_sql())
         instance_list = []
         for row in raw_results:
-            instance: "Model" = self.model._init_from_db(**row)
+            if self.select_related_idx:
+                _, current_idx, _, _ = self.select_related_idx[0]
+                dict_row = dict(row)
+                keys = list(dict_row.keys())
+                values = list(dict_row.values())
+                instance: "Model" = self.model._init_from_db(
+                    **dict(zip(keys[:current_idx], values[:current_idx]))
+                )
+                instances = [instance]
+                for model, index, model_name, parent_model in self.select_related_idx[1:]:
+                    obj = model._init_from_db(
+                        **dict(
+                            zip(
+                                map(
+                                    lambda x: x.split(".")[1],
+                                    keys[current_idx : current_idx + index],  # noqa
+                                ),
+                                values[current_idx : current_idx + index],  # noqa
+                            )
+                        )
+                    )
+                    for ins in instances:
+                        if isinstance(ins, parent_model):
+                            setattr(ins, model_name, obj)
+                    instances.append(obj)
+                    current_idx += index
+            else:
+                instance = self.model._init_from_db(**row)
             if custom_fields:
                 for field in custom_fields:
                     setattr(instance, field, row[field])
@@ -132,48 +177,67 @@ class BaseExecutor:
             return cls.TO_DB_OVERRIDE[field_object.__class__](field_object, attr, instance)
         return field_object.to_db_value(attr, instance)
 
-    def _prepare_insert_statement(self, columns: List[str], no_generated: bool = False) -> str:
+    def _prepare_insert_statement(self, columns: Sequence[str], has_generated: bool = True) -> str:
         # Insert should implement returning new id to saved object
         # Each db has it's own methods for it, so each implementation should
         # go to descendant executors
         return str(
             self.db.query_class.into(self.model._meta.basetable)
             .columns(*columns)
-            .insert(*[self.Parameter(i) for i in range(len(columns))])
+            .insert(*[self.parameter(i) for i in range(len(columns))])
         )
 
     async def _process_insert_result(self, instance: "Model", results: Any) -> None:
         raise NotImplementedError()  # pragma: nocoverage
 
-    def Parameter(self, pos: int) -> Parameter:
+    def parameter(self, pos: int) -> Parameter:
         raise NotImplementedError()  # pragma: nocoverage
 
     async def execute_insert(self, instance: "Model") -> None:
         if not instance._custom_generated_pk:
             values = [
-                self.column_map[column](getattr(instance, column), instance)
-                for column in self.regular_columns
+                self.column_map[field_name](getattr(instance, field_name), instance)
+                for field_name in self.regular_columns
             ]
             insert_result = await self.db.execute_insert(self.insert_query, values)
             await self._process_insert_result(instance, insert_result)
+
         else:
             values = [
-                self.column_map[column](getattr(instance, column), instance)
-                for column in self.regular_columns_all
+                self.column_map[field_name](getattr(instance, field_name), instance)
+                for field_name in self.regular_columns_all
             ]
             await self.db.execute_insert(self.insert_query_all, values)
 
-    async def execute_bulk_insert(self, instances: "List[Model]") -> None:
-        values_lists = [
-            [
-                self.column_map[column](getattr(instance, column), instance)
-                for column in self.regular_columns
-            ]
-            for instance in instances
-        ]
-        await self.db.execute_many(self.insert_query, values_lists)
+    async def execute_bulk_insert(self, instances: "Iterable[Model]") -> None:
+        values_lists_all = []
+        values_lists = []
+        for instance in instances:
+            if instance._custom_generated_pk:
+                values_lists_all.append(
+                    [
+                        self.column_map[field_name](getattr(instance, field_name), instance)
+                        for field_name in self.regular_columns_all
+                    ]
+                )
+            else:
+                values_lists.append(
+                    [
+                        self.column_map[field_name](getattr(instance, field_name), instance)
+                        for field_name in self.regular_columns
+                    ]
+                )
 
-    def get_update_sql(self, update_fields: Optional[List[str]]) -> str:
+        if values_lists_all:
+            await self.db.execute_many(self.insert_query_all, values_lists_all)
+        if values_lists:
+            await self.db.execute_many(self.insert_query, values_lists)
+
+    def get_update_sql(
+        self,
+        update_fields: Optional[Iterable[str]],
+        arithmetic_or_function: Optional[Dict[str, Union[ArithmeticExpression, Function]]],
+    ) -> str:
         """
         Generates the SQL for updating a model depending on provided update_fields.
         Result is cached for performance.
@@ -181,32 +245,44 @@ class BaseExecutor:
         key = ",".join(update_fields) if update_fields else ""
         if key in self.update_cache:
             return self.update_cache[key]
-
+        arithmetic_or_function = arithmetic_or_function or {}
         table = self.model._meta.basetable
         query = self.db.query_class.update(table)
         count = 0
         for field in update_fields or self.model._meta.fields_db_projection.keys():
-            db_field = self.model._meta.fields_db_projection[field]
+            db_column = self.model._meta.fields_db_projection[field]
             field_object = self.model._meta.fields_map[field]
             if not field_object.pk:
-                query = query.set(db_field, self.Parameter(count))
-                count += 1
+                if db_column not in arithmetic_or_function.keys():
+                    query = query.set(db_column, self.parameter(count))
+                    count += 1
+                else:
+                    query = query.set(db_column, arithmetic_or_function.get(db_column))
 
-        query = query.where(table[self.model._meta.db_pk_field] == self.Parameter(count))
+        query = query.where(table[self.model._meta.db_pk_column] == self.parameter(count))
 
         sql = self.update_cache[key] = query.get_sql()
         return sql
 
     async def execute_update(
-        self, instance: "Union[Type[Model], Model]", update_fields: Optional[List[str]]
+        self, instance: "Union[Type[Model], Model]", update_fields: Optional[Iterable[str]]
     ) -> int:
-        values = [
-            self.column_map[field](getattr(instance, field), instance)
-            for field in update_fields or self.model._meta.fields_db_projection.keys()
-            if not self.model._meta.fields_map[field].pk
-        ]
+        values = []
+        arithmetic_or_function = {}
+        for field in update_fields or self.model._meta.fields_db_projection.keys():
+            if not self.model._meta.fields_map[field].pk:
+                instance_field = getattr(instance, field)
+                if isinstance(instance_field, (ArithmeticExpression, Function)):
+                    arithmetic_or_function[field] = instance_field
+                else:
+                    value = self.column_map[field](instance_field, instance)
+                    values.append(value)
         values.append(self.model._meta.pk.to_db_value(instance.pk, instance))
-        return (await self.db.execute_query(self.get_update_sql(update_fields), values))[0]
+        return (
+            await self.db.execute_query(
+                self.get_update_sql(update_fields, arithmetic_or_function), values
+            )
+        )[0]
 
     async def execute_delete(self, instance: "Union[Type[Model], Model]") -> int:
         return (
@@ -216,8 +292,12 @@ class BaseExecutor:
         )[0]
 
     async def _prefetch_reverse_relation(
-        self, instance_list: "List[Model]", field: str, related_query: "QuerySet"
-    ) -> list:
+        self,
+        instance_list: "Iterable[Model]",
+        field: str,
+        related_query: Tuple[Optional[str], "QuerySet"],
+    ) -> "Iterable[Model]":
+        to_attr, related_query = related_query
         related_objects_for_fetch: Dict[str, list] = {}
         related_field: BackwardFKRelation = self.model._meta.fields_map[field]  # type: ignore
         related_field_name = related_field.to_field_instance.model_field_name
@@ -251,13 +331,17 @@ class BaseExecutor:
         for instance in instance_list:
             relation_container = getattr(instance, field)
             relation_container._set_result_for_query(
-                related_object_map.get(getattr(instance, related_field_name), [])
+                related_object_map.get(getattr(instance, related_field_name), []), to_attr,
             )
         return instance_list
 
     async def _prefetch_reverse_o2o_relation(
-        self, instance_list: list, field: str, related_query: "QuerySet"
-    ) -> list:
+        self,
+        instance_list: "Iterable[Model]",
+        field: str,
+        related_query: Tuple[Optional[str], "QuerySet"],
+    ) -> "Iterable[Model]":
+        to_attr, related_query = related_query
         related_objects_for_fetch: Dict[str, list] = {}
         related_field: BackwardOneToOneRelation = self.model._meta.fields_map[field]  # type: ignore
         related_field_name = related_field.to_field_instance.model_field_name
@@ -284,17 +368,21 @@ class BaseExecutor:
             related_object_map[object_id] = entry
 
         for instance in instance_list:
+            obj = related_object_map.get(getattr(instance, related_field_name), None)
             setattr(
-                instance,
-                f"_{field}",
-                related_object_map.get(getattr(instance, related_field_name), None),
+                instance, f"_{field}", obj,
             )
-
+            if to_attr:
+                setattr(instance, to_attr, obj)
         return instance_list
 
     async def _prefetch_m2m_relation(
-        self, instance_list: "List[Model]", field: str, related_query: "QuerySet"
-    ) -> list:
+        self,
+        instance_list: "Iterable[Model]",
+        field: str,
+        related_query: Tuple[Optional[str], "QuerySet"],
+    ) -> "Iterable[Model]":
+        to_attr, related_query = related_query
         instance_id_set: set = {
             self._field_to_db(instance._meta.pk, instance.pk, instance)
             for instance in instance_list
@@ -316,7 +404,7 @@ class BaseExecutor:
         )
 
         related_query_table = related_query.model._meta.basetable
-        related_pk_field = related_query.model._meta.db_pk_field
+        related_pk_field = related_query.model._meta.db_pk_column
         related_query.resolve_ordering(related_query.model, related_query_table, [], {})
         query = (
             related_query.query.join(subquery)
@@ -355,7 +443,7 @@ class BaseExecutor:
         relations = [
             (
                 self.model._meta.pk.to_python_value(e["_backward_relation_key"]),
-                field_object.model_class._meta.pk.to_python_value(e[related_pk_field]),
+                field_object.related_model._meta.pk.to_python_value(e[related_pk_field]),
             )
             for e in raw_results
         ]
@@ -373,17 +461,23 @@ class BaseExecutor:
 
         for instance in instance_list:
             relation_container = getattr(instance, field)
-            relation_container._set_result_for_query(relation_map.get(instance.pk, []))
+            relation_container._set_result_for_query(relation_map.get(instance.pk, []), to_attr)
         return instance_list
 
     async def _prefetch_direct_relation(
-        self, instance_list: "List[Model]", field: str, related_query: "QuerySet"
-    ) -> "List[Model]":
+        self,
+        instance_list: "Iterable[Model]",
+        field: str,
+        related_query: Tuple[Optional[str], "QuerySet"],
+    ) -> "Iterable[Model]":
+        # TODO: This will only work if instance_list is all of same type
+        # TODO: If that's the case, then we can optimize the key resolver
+        to_attr, related_query = related_query
         related_objects_for_fetch: Dict[str, list] = {}
         relation_key_field = f"{field}_id"
         for instance in instance_list:
             if getattr(instance, relation_key_field):
-                key = instance._meta.fields_map[relation_key_field].model_field_name
+                key = cast(RelationalField, instance._meta.fields_map[field]).to_field
                 if key not in related_objects_for_fetch:
                     related_objects_for_fetch[key] = []
                 related_objects_for_fetch[key].append(getattr(instance, relation_key_field))
@@ -396,27 +490,32 @@ class BaseExecutor:
             )
             related_object_map = {getattr(obj, key): obj for obj in related_object_list}
             for instance in instance_list:
-                setattr(
-                    instance, field, related_object_map.get(getattr(instance, relation_key_field))
-                )
+                obj = related_object_map.get(getattr(instance, relation_key_field))
+                setattr(instance, field, obj)
+                if to_attr:
+                    setattr(instance, to_attr, obj)
         return instance_list
 
     def _make_prefetch_queries(self) -> None:
-        for field, forwarded_prefetches in self.prefetch_map.items():
-            if field in self._prefetch_queries:
-                related_query = self._prefetch_queries[field]
+        for field_name, forwarded_prefetches in self.prefetch_map.items():
+            to_attr = None
+            if field_name in self._prefetch_queries:
+                to_attr, related_query = self._prefetch_queries[field_name][0]
             else:
-                related_model_field = self.model._meta.fields_map[field]
-                related_model: "Type[Model]" = related_model_field.model_class  # type: ignore
+                relation_field = self.model._meta.fields_map[field_name]
+                related_model: "Type[Model]" = relation_field.related_model  # type: ignore
                 related_query = related_model.all().using_db(self.db)
                 related_query.query = copy(related_query.model._meta.basequery)
             if forwarded_prefetches:
                 related_query = related_query.prefetch_related(*forwarded_prefetches)
-            self._prefetch_queries[field] = related_query
+            self._prefetch_queries.setdefault(field_name, []).append((to_attr, related_query))
 
     async def _do_prefetch(
-        self, instance_id_list: "List[Model]", field: str, related_query: "QuerySet"
-    ) -> "List[Model]":
+        self,
+        instance_id_list: "Iterable[Model]",
+        field: str,
+        related_query: Tuple[Optional[str], "QuerySet"],
+    ) -> "Iterable[Model]":
         if field in self.model._meta.backward_fk_fields:
             return await self._prefetch_reverse_relation(instance_id_list, field, related_query)
 
@@ -427,28 +526,34 @@ class BaseExecutor:
             return await self._prefetch_m2m_relation(instance_id_list, field, related_query)
         return await self._prefetch_direct_relation(instance_id_list, field, related_query)
 
-    async def _execute_prefetch_queries(self, instance_list: "List[Model]") -> "List[Model]":
+    async def _execute_prefetch_queries(
+        self, instance_list: "Iterable[Model]"
+    ) -> "Iterable[Model]":
         if instance_list and (self.prefetch_map or self._prefetch_queries):
             self._make_prefetch_queries()
-            prefetch_tasks = [
-                self._do_prefetch(instance_list, field, related_query)
-                for field, related_query in self._prefetch_queries.items()
-            ]
+            prefetch_tasks = []
+            for field, related_queries in self._prefetch_queries.items():
+                for related_query in related_queries:
+                    prefetch_tasks.append(self._do_prefetch(instance_list, field, related_query))
             await asyncio.gather(*prefetch_tasks)
 
         return instance_list
 
-    async def fetch_for_list(self, instance_list: "List[Model]", *args: str) -> "List[Model]":
+    async def fetch_for_list(
+        self, instance_list: "Iterable[Model]", *args: str
+    ) -> "Iterable[Model]":
         self.prefetch_map = {}
         for relation in args:
             relation_split = relation.split("__")
             first_level_field = relation_split[0]
             if first_level_field not in self.model._meta.fetch_fields:
                 raise OperationalError(
-                    f"relation {first_level_field} for {self.model._meta.table} not found"
+                    f"relation {first_level_field} for {self.model._meta.db_table} not found"
                 )
+
             if first_level_field not in self.prefetch_map.keys():
                 self.prefetch_map[first_level_field] = set()
+
             forwarded_prefetch = "__".join(relation_split[1:])
             if forwarded_prefetch:
                 self.prefetch_map[first_level_field].add(forwarded_prefetch)
