@@ -1,7 +1,13 @@
-*
+
 """""""""""""""""""""""""""""""""""""""""
 Special fork for the code-skills project
 """""""""""""""""""""""""""""""""""""""""
+
+## installation:
+
+```
+pip install git+https://github.com/Sanshain/tortoise-orm.git
+```
 
 **See below original description and acording links:**
 
